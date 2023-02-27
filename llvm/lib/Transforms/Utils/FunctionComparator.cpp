@@ -184,6 +184,44 @@ int FunctionComparator::cmpRangeMetadata(const MDNode *L,
   return 0;
 }
 
+int FunctionComparator::cmpLoadInstMetadata(LoadInst const *L,
+                                            LoadInst const *R) const {
+  if (L == R)
+    return 0;
+  if (!L)
+    return -1;
+  if (!R)
+    return 1;
+
+  /// Compare metadata with empty nodes
+  /// These metadata affects the other optimization passes by making assertions
+  /// or constraints.
+  /// Values that carries different expectations should be considered different.
+  /// First, check metadata with empty nodes:
+  for (auto Kind : {LLVMContext::MD_nonnull, LLVMContext::MD_invariant_group,
+                    LLVMContext::MD_invariant_load, LLVMContext::MD_noundef}) {
+    auto ML = bool(L->getMetadata(Kind));
+    auto MR = bool(R->getMetadata(Kind));
+    if (ML != MR)
+      return ML - MR;
+  }
+  /// We are left with `dereferenceable` and `dereferenceable_or_null`,
+  /// which carries a single parameter for the size of dereferenceable
+  /// data behind the result:
+  for (auto Kind : {LLVMContext::MD_dereferenceable,
+                    LLVMContext::MD_dereferenceable_or_null}) {
+    auto ML = L->getMetadata(Kind);
+    auto MR = R->getMetadata(Kind);
+    if (ML == MR)
+      continue;
+    auto VL = mdconst::extract<ConstantInt>(ML->getOperand(0));
+    auto VR = mdconst::extract<ConstantInt>(MR->getOperand(0));
+    if (int Res = cmpAPInts(VL->getValue(), VR->getValue()))
+      return Res;
+  }
+  return 0;
+}
+
 int FunctionComparator::cmpOperandBundlesSchema(const CallBase &LCS,
                                                 const CallBase &RCS) const {
   assert(LCS.getOpcode() == RCS.getOpcode() && "Can't compare otherwise!");
@@ -586,9 +624,11 @@ int FunctionComparator::cmpOperations(const Instruction *L,
     if (int Res = cmpNumbers(LI->getSyncScopeID(),
                              cast<LoadInst>(R)->getSyncScopeID()))
       return Res;
-    return cmpRangeMetadata(
-        LI->getMetadata(LLVMContext::MD_range),
-        cast<LoadInst>(R)->getMetadata(LLVMContext::MD_range));
+    if (int Res = cmpRangeMetadata(
+            LI->getMetadata(LLVMContext::MD_range),
+            cast<LoadInst>(R)->getMetadata(LLVMContext::MD_range)))
+      return Res;
+    return cmpLoadInstMetadata(LI, cast<LoadInst>(R));
   }
   if (const StoreInst *SI = dyn_cast<StoreInst>(L)) {
     if (int Res =
